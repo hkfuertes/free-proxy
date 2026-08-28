@@ -1,0 +1,6 @@
+.env
+.env.*
+*.test
+coverage.out
+free_proxy/free-proxy
+.DS_Store

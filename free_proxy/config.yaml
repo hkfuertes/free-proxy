@@ -1,0 +1,27 @@
+name: Free Proxy
+slug: free_proxy
+version: "0.1.0"
+description: OpenAI-compatible proxy for zero-price OpenCode and OpenRouter models
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: services
+boot: auto
+init: false
+ports:
+  8080/tcp: 8080
+ports_description:
+  8080/tcp: OpenAI-compatible API
+options:
+  openrouter_api_key: ""
+  proxy_api_key: ""
+  default_model: opencode/big-pickle
+  listen_addr: 0.0.0.0:8080
+schema:
+  openrouter_api_key: password?
+  proxy_api_key: password?
+  default_model: str
+  listen_addr: str
