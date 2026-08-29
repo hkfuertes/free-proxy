@@ -27,9 +27,10 @@ type Response struct {
 	Stream bool
 }
 
-// RequestError means the caller supplied an invalid OpenAI request.
+// RequestError describes a rejected request or an unavailable free model.
 type RequestError struct {
-	Message string
+	Message          string
+	ModelUnavailable bool
 }
 
 func (e *RequestError) Error() string { return e.Message }

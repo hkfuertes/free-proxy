@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -123,7 +125,7 @@ func TestProvidersShareFreeModelListAndRouteRequests(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 			t.Fatal(err)
 		}
-		if len(response.Data) != 2 || response.Data[0].ID != "opencode/big-pickle" || response.Data[1].ID != "openrouter/free/model:free" || response.Data[1].OwnedBy != "openrouter" {
+		if len(response.Data) != 3 || response.Data[0].ID != defaultModelID || response.Data[0].OwnedBy != "free-proxy" || response.Data[1].ID != "opencode/big-pickle" || response.Data[2].ID != "openrouter/free/model:free" || response.Data[2].OwnedBy != "openrouter" {
 			t.Fatalf("unexpected models: %s", rec.Body.String())
 		}
 	})
@@ -158,5 +160,142 @@ func TestProvidersShareFreeModelListAndRouteRequests(t *testing.T) {
 
 	if openCodeCalls != 1 || openRouterCalls != 1 {
 		t.Fatalf("unexpected upstream calls: OpenCode=%d OpenRouter=%d", openCodeCalls, openRouterCalls)
+	}
+}
+
+type testProvider struct {
+	id       string
+	models   []provider.Model
+	complete func(provider.Request) (provider.Response, error)
+}
+
+func (p testProvider) ID() string               { return p.id }
+func (p testProvider) Models() []provider.Model { return p.models }
+func (p testProvider) Complete(_ context.Context, request provider.Request) (provider.Response, error) {
+	return p.complete(request)
+}
+
+func testResponse(status int, body string) provider.Response {
+	return provider.Response{HTTP: &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}}
+}
+
+func TestDefaultModelFallsBack(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		first func() (provider.Response, error)
+	}{
+		{
+			name: "rate limit",
+			first: func() (provider.Response, error) {
+				return testResponse(http.StatusTooManyRequests, `{"error":"rate limited"}`), nil
+			},
+		},
+		{
+			name: "model is no longer free",
+			first: func() (provider.Response, error) {
+				return provider.Response{}, &provider.RequestError{Message: "model is no longer free", ModelUnavailable: true}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls []string
+			first := testProvider{
+				id:     "first",
+				models: []provider.Model{{ID: "best"}},
+				complete: func(request provider.Request) (provider.Response, error) {
+					calls = append(calls, "first/"+request.Model)
+					return test.first()
+				},
+			}
+			second := testProvider{
+				id:     "second",
+				models: []provider.Model{{ID: "fallback"}},
+				complete: func(request provider.Request) (provider.Response, error) {
+					calls = append(calls, "second/"+request.Model)
+					return testResponse(http.StatusOK, `{"choices":[{"message":{"content":"fallback"}}]}`), nil
+				},
+			}
+			app, err := newApp([]provider.Provider{first, second}, defaultModelID, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			rec := httptest.NewRecorder()
+			app.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"hi"}]}`)))
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "fallback") {
+				t.Fatalf("unexpected response: %d %s", rec.Code, rec.Body.String())
+			}
+			if got := strings.Join(calls, ","); got != "first/best,second/fallback" {
+				t.Fatalf("calls = %q", got)
+			}
+		})
+	}
+}
+
+func TestRerankSavesAndUsesRanking(t *testing.T) {
+	calls := 0
+	ranker := testProvider{
+		id:     "ranker",
+		models: []provider.Model{{ID: "best"}, {ID: "fallback"}},
+		complete: func(request provider.Request) (provider.Response, error) {
+			calls++
+			var messages []struct {
+				Content string `json:"content"`
+			}
+			if err := json.Unmarshal(request.Payload["messages"], &messages); err != nil || len(messages) != 1 || !strings.Contains(messages[0].Content, "ranker/best") || !strings.Contains(messages[0].Content, "ranker/fallback") {
+				t.Errorf("unexpected ranking prompt: %s", request.Payload["messages"])
+			}
+			return testResponse(http.StatusOK, `{"choices":[{"message":{"content":"[\"ranker/fallback\",\"ranker/best\"]"}}]}`), nil
+		},
+	}
+	app, err := newApp([]provider.Provider{ranker}, defaultModelID, "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.rankingPath = t.TempDir() + "/ranking.json"
+	if err := app.loadOrCreateRanking(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || app.defaultCandidateIDs()[0] != "ranker/fallback" {
+		t.Fatalf("initial calls=%d ranking=%v", calls, app.defaultCandidateIDs())
+	}
+
+	ui := httptest.NewRecorder()
+	uiRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	uiRequest.RemoteAddr = "172.30.32.2:1234"
+	app.ServeHTTP(ui, uiRequest)
+	if ui.Code != http.StatusOK || !strings.Contains(ui.Body.String(), "Rerank free models") {
+		t.Fatalf("unexpected ingress UI: %d %s", ui.Code, ui.Body.String())
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/rerank", nil)
+	req.Header.Set("Authorization", "Bearer key")
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected rerank response: %d %s", rec.Code, rec.Body.String())
+	}
+	var ranking savedRanking
+	if err := json.Unmarshal(rec.Body.Bytes(), &ranking); err != nil || ranking.RankedBy != "ranker/fallback" {
+		t.Fatalf("unexpected rerank result: %s", rec.Body.String())
+	}
+	if calls != 2 || app.defaultCandidateIDs()[0] != "ranker/fallback" {
+		t.Fatalf("calls=%d ranking=%v", calls, app.defaultCandidateIDs())
+	}
+
+	reloaded, err := newApp([]provider.Provider{ranker}, defaultModelID, "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded.rankingPath = app.rankingPath
+	if err := reloaded.loadRanking(); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.defaultCandidateIDs()[0] != "ranker/fallback" {
+		t.Fatalf("reloaded ranking=%v", reloaded.defaultCandidateIDs())
 	}
 }

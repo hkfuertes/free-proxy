@@ -11,6 +11,8 @@ arch:
 startup: services
 boot: auto
 init: false
+ingress: true
+ingress_port: 8080
 ports:
   8080/tcp: 8080
 ports_description:
@@ -18,7 +20,7 @@ ports_description:
 options:
   openrouter_api_key: ""
   proxy_api_key: ""
-  default_model: opencode/big-pickle
+  default_model: default
   listen_addr: 0.0.0.0:8080
 schema:
   openrouter_api_key: password?

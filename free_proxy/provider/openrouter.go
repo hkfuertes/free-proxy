@@ -75,7 +75,7 @@ func (p *OpenRouter) Complete(ctx context.Context, request Request) (Response, e
 		return Response{}, fmt.Errorf("check OpenRouter model pricing: %w", err)
 	}
 	if !containsModel(models, request.Model) {
-		return Response{}, &RequestError{Message: "model is no longer free in OpenRouter"}
+		return Response{}, &RequestError{Message: "model is no longer free in OpenRouter", ModelUnavailable: true}
 	}
 
 	model, _ := json.Marshal(request.Model)
@@ -111,8 +111,8 @@ type openRouterCatalog struct {
 }
 
 type openRouterModel struct {
-	ID      string            `json:"id"`
-	Pricing map[string]string `json:"pricing"`
+	ID      string                     `json:"id"`
+	Pricing map[string]json.RawMessage `json:"pricing"`
 }
 
 func discoverFreeModels(ctx context.Context, client *http.Client, endpoint, apiKey string) ([]Model, error) {
@@ -144,15 +144,55 @@ func discoverFreeModels(ctx context.Context, client *http.Client, endpoint, apiK
 	return models, nil
 }
 
-func freePricing(pricing map[string]string) bool {
-	if len(pricing) == 0 {
-		return false
-	}
-	for _, amount := range pricing {
-		price, ok := new(big.Rat).SetString(strings.TrimSpace(amount))
-		if !ok || price.Sign() != 0 {
+func freePricing(pricing map[string]json.RawMessage) bool {
+	priceFields := 0
+	for field, amount := range pricing {
+		if field == "overrides" {
+			if !freePricingOverrides(amount) {
+				return false
+			}
+			continue
+		}
+		priceFields++
+		if !freePrice(amount) {
 			return false
 		}
 	}
+	return priceFields > 0
+}
+
+func freePricingOverrides(raw json.RawMessage) bool {
+	var overrides []map[string]json.RawMessage
+	if len(raw) == 0 || string(raw) == "null" || json.Unmarshal(raw, &overrides) != nil {
+		return false
+	}
+	for _, override := range overrides {
+		for field, amount := range override {
+			if overrideCondition(field) {
+				continue
+			}
+			if !freePrice(amount) {
+				return false
+			}
+		}
+	}
 	return true
+}
+
+func overrideCondition(field string) bool {
+	switch field {
+	case "utc_days", "utc_start", "utc_end", "min_prompt_tokens":
+		return true
+	default:
+		return false
+	}
+}
+
+func freePrice(raw json.RawMessage) bool {
+	var amount string
+	if json.Unmarshal(raw, &amount) != nil {
+		return false
+	}
+	price, ok := new(big.Rat).SetString(strings.TrimSpace(amount))
+	return ok && price.Sign() == 0
 }

@@ -91,7 +91,7 @@ func (p *OpenCode) Complete(ctx context.Context, request Request) (Response, err
 		return Response{}, fmt.Errorf("check OpenCode model pricing: %w", err)
 	}
 	if !containsModel(models, request.Model) {
-		return Response{}, &RequestError{Message: "model is no longer free in OpenCode"}
+		return Response{}, &RequestError{Message: "model is no longer free in OpenCode", ModelUnavailable: true}
 	}
 
 	model, _ := json.Marshal(request.Model)
