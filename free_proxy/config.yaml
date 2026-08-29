@@ -1,6 +1,6 @@
 name: Free Proxy
 slug: free_proxy
-version: "0.1.1"
+version: "0.1.2"
 description: OpenAI-compatible proxy for zero-price OpenCode and OpenRouter models
 arch:
   - aarch64
@@ -21,9 +21,11 @@ options:
   openrouter_api_key: ""
   proxy_api_key: ""
   default_model: default
+  enable_thinking: false
   listen_addr: 0.0.0.0:8080
 schema:
   openrouter_api_key: password?
   proxy_api_key: password?
   default_model: str
+  enable_thinking: bool
   listen_addr: str

@@ -8,7 +8,7 @@ import (
 
 func TestAddOnOptionsAndEnvironmentPrecedence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "options.json")
-	if err := os.WriteFile(path, []byte(`{"openrouter_api_key":"from-addon","proxy_api_key":"addon-proxy","default_model":"opencode/big-pickle","listen_addr":"0.0.0.0:8080"}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"openrouter_api_key":"from-addon","proxy_api_key":"addon-proxy","default_model":"opencode/big-pickle","enable_thinking":true,"listen_addr":"0.0.0.0:8080"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("OPTIONS_PATH", path)
@@ -22,5 +22,12 @@ func TestAddOnOptionsAndEnvironmentPrecedence(t *testing.T) {
 	}
 	if got := envOrOption("PROXY_API_KEY", options.ProxyAPIKey, ""); got != "addon-proxy" {
 		t.Fatalf("proxy key = %q", got)
+	}
+	if got, err := boolEnvOrOption("ENABLE_THINKING", options.EnableThinking, false); err != nil || !got {
+		t.Fatalf("thinking = %t, %v", got, err)
+	}
+	t.Setenv("ENABLE_THINKING", "false")
+	if got, err := boolEnvOrOption("ENABLE_THINKING", options.EnableThinking, false); err != nil || got {
+		t.Fatalf("environment thinking = %t, %v", got, err)
 	}
 }

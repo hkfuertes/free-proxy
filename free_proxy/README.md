@@ -18,6 +18,7 @@ openrouter/nvidia/nemotron-3.5-lightning:free
 - `/v1/models` is the startup snapshot. Restart the add-on or container to refresh the displayed list.
 - `default` is a virtual model: it tries the saved ranking, then the remaining free models, retrying only `429` and `5xx` responses.
 - Concrete model entries include their advertised `max_tokens`; explicit `max_tokens` and `max_completion_tokens` values are capped before the request is sent upstream.
+- Thinking is disabled by default. The proxy requests `reasoning.enabled: false`, removes client reasoning overrides, and skips catalog-marked mandatory-thinking models from `default`.
 
 OpenRouter is enabled only when an API key is configured. Its catalog is filtered so every published price must be zero.
 
@@ -87,6 +88,7 @@ Mount `/data` in standalone Docker if the ranking must survive container replace
 | `openrouter_api_key` | Enables OpenRouter. |
 | `proxy_api_key` | Protects the proxy API. |
 | `default_model` | `default` (the free-model route) or an exact ID from `/v1/models`. |
+| `enable_thinking` | Defaults to `false`; set to `true` to allow provider reasoning. |
 | `listen_addr` | Defaults to `0.0.0.0:8080`. |
 
 The add-on reads these options from `/data/options.json`. Equivalent environment variables take precedence, so the same image works standalone and as an add-on:
@@ -96,6 +98,7 @@ The add-on reads these options from `/data/options.json`. Equivalent environment
 | `OPENROUTER_API_KEY` | OpenRouter key. |
 | `PROXY_API_KEY` | Key required from proxy clients. |
 | `DEFAULT_MODEL` | Default model, including its provider prefix. |
+| `ENABLE_THINKING` | Set to `true` to allow provider reasoning; defaults to `false`. |
 | `LISTEN_ADDR` | Listening address. |
 | `OPENCODE_API_KEY` | Defaults to `public`; accepts a real Zen key. |
 | `OPENCODE_UPSTREAM` / `OPENCODE_CATALOG` | Zen and catalog URLs. |
@@ -103,7 +106,7 @@ The add-on reads these options from `/data/options.json`. Equivalent environment
 | `OPTIONS_PATH` | Add-on options path; defaults to `/data/options.json`. |
 | `RANKING_PATH` | Saved `default` ranking; defaults to `/data/free-proxy-ranking.json`. |
 
-Open the add-on's Web UI to browse and copy available model IDs, then paste an exact ID into `default_model` if you want to pin one. Click **Rerank free models** there to refresh `default`; Home Assistant ingress authenticates the UI. The native add-on settings schema cannot provide a custom action button.
+Open the add-on's Web UI to browse and copy available model IDs, then paste an exact ID into `default_model` if you want to pin one. Set `enable_thinking` in add-on configuration when a client needs model reasoning. Click **Rerank free models** there to refresh `default`; Home Assistant ingress authenticates the UI. The native add-on settings schema cannot provide a custom action button.
 
 Configure an OpenAI-compatible Home Assistant client with:
 

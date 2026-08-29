@@ -333,3 +333,50 @@ func TestDefaultModelClampsMaxTokens(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestThinkingPolicyDisablesAndSkipsRequiredModels(t *testing.T) {
+	var calls []provider.Request
+	source := testProvider{
+		id: "test",
+		models: []provider.Model{
+			{ID: "required", ThinkingRequired: true},
+			{ID: "allowed"},
+		},
+		complete: func(request provider.Request) (provider.Response, error) {
+			calls = append(calls, request)
+			return testResponse(http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`), nil
+		},
+	}
+	app, err := newApp([]provider.Provider{source}, defaultModelID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.defaultCandidates = []string{"test/required", "test/allowed"}
+
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"default","include_reasoning":true,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK || len(calls) != 1 || calls[0].Model != "allowed" {
+		t.Fatalf("default response=%d calls=%#v", rec.Code, calls)
+	}
+	var reasoning map[string]bool
+	if err := json.Unmarshal(calls[0].Payload["reasoning"], &reasoning); err != nil {
+		t.Fatalf("thinking payload=%v", calls[0].Payload)
+	}
+	enabled, ok := reasoning["enabled"]
+	if !ok || enabled || calls[0].Payload["include_reasoning"] != nil || calls[0].Payload["reasoning_effort"] != nil {
+		t.Fatalf("thinking payload=%v", calls[0].Payload)
+	}
+
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test/required","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusBadRequest || len(calls) != 1 {
+		t.Fatalf("required response=%d calls=%#v", rec.Code, calls)
+	}
+
+	app.thinking = true
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test/required","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK || len(calls) != 2 || calls[1].Payload["reasoning"] != nil {
+		t.Fatalf("enabled response=%d calls=%#v", rec.Code, calls)
+	}
+}
