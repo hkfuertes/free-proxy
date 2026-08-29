@@ -116,6 +116,9 @@ type openRouterModel struct {
 	TopProvider struct {
 		MaxTokens int `json:"max_completion_tokens"`
 	} `json:"top_provider"`
+	Reasoning struct {
+		Mandatory bool `json:"mandatory"`
+	} `json:"reasoning"`
 }
 
 func discoverFreeModels(ctx context.Context, client *http.Client, endpoint, apiKey string) ([]Model, error) {
@@ -141,7 +144,7 @@ func discoverFreeModels(ctx context.Context, client *http.Client, endpoint, apiK
 	models := make([]Model, 0, len(catalog.Data))
 	for _, model := range catalog.Data {
 		if model.ID != "" && freePricing(model.Pricing) {
-			models = append(models, Model{ID: model.ID, MaxTokens: model.TopProvider.MaxTokens})
+			models = append(models, Model{ID: model.ID, MaxTokens: model.TopProvider.MaxTokens, ThinkingRequired: model.Reasoning.Mandatory})
 		}
 	}
 	return models, nil

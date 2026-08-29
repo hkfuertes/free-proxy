@@ -11,8 +11,9 @@ import (
 
 // Model is an upstream model ID exposed unchanged by the proxy.
 type Model struct {
-	ID        string
-	MaxTokens int
+	ID               string
+	MaxTokens        int
+	ThinkingRequired bool
 }
 
 // Request is an OpenAI chat-completion payload destined for one provider.

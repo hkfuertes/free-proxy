@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -11,6 +13,7 @@ type addOnOptions struct {
 	OpenRouterAPIKey string `json:"openrouter_api_key"`
 	ProxyAPIKey      string `json:"proxy_api_key"`
 	DefaultModel     string `json:"default_model"`
+	EnableThinking   bool   `json:"enable_thinking"`
 	ListenAddr       string `json:"listen_addr"`
 }
 
@@ -38,4 +41,19 @@ func envOrOption(name, option, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func boolEnvOrOption(name string, option, fallback bool) (bool, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		if option {
+			return true, nil
+		}
+		return fallback, nil
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean: %w", name, err)
+	}
+	return enabled, nil
 }

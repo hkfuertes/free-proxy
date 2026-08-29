@@ -50,14 +50,16 @@ type app struct {
 	defaultCandidates []string
 	rankingPath       string
 	clientKey         string
+	thinking          bool
 	rankingMu         sync.RWMutex
 	rerankMu          sync.Mutex
 }
 
 type resolvedModel struct {
-	source    provider.Provider
-	id        string
-	maxTokens int
+	source           provider.Provider
+	id               string
+	maxTokens        int
+	thinkingRequired bool
 }
 
 func main() {
@@ -72,7 +74,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
-	log.Printf("listening on %s; default model %s", listenAddr, server.defaultModel)
+	log.Printf("listening on %s; default model %s; thinking enabled=%t", listenAddr, server.defaultModel, server.thinking)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -110,10 +112,15 @@ func appFromEnv() (*app, string, error) {
 		fallbackModel = "opencode/" + model
 	}
 	defaultModel := envOrOption("DEFAULT_MODEL", options.DefaultModel, fallbackModel)
+	thinking, err := boolEnvOrOption("ENABLE_THINKING", options.EnableThinking, false)
+	if err != nil {
+		return nil, "", fmt.Errorf("configure thinking: %w", err)
+	}
 	server, err := newApp(sources, defaultModel, envOrOption("PROXY_API_KEY", options.ProxyAPIKey, ""))
 	if err != nil {
 		return nil, "", err
 	}
+	server.thinking = thinking
 	for _, source := range sources {
 		log.Printf("provider %s: %d free models", source.ID(), len(source.Models()))
 	}
@@ -139,7 +146,7 @@ func newApp(sources []provider.Provider, defaultModel, clientKey string) (*app, 
 			if existing, exists := models[publicID]; exists {
 				return nil, fmt.Errorf("model %q belongs to both %s and %s", publicID, existing.source.ID(), source.ID())
 			}
-			models[publicID] = resolvedModel{source: source, id: model.ID, maxTokens: model.MaxTokens}
+			models[publicID] = resolvedModel{source: source, id: model.ID, maxTokens: model.MaxTokens, thinkingRequired: model.ThinkingRequired}
 		}
 	}
 	if len(models) == 0 {
@@ -319,8 +326,13 @@ func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if modelID != defaultModelID {
-		if _, ok := a.models[modelID]; !ok {
+		model, ok := a.models[modelID]
+		if !ok {
 			writeAPIError(w, http.StatusBadRequest, "model is not configured", "invalid_request_error", "model_not_found")
+			return
+		}
+		if !a.thinking && model.thinkingRequired {
+			writeAPIError(w, http.StatusBadRequest, "model requires thinking; enable thinking or use default", "invalid_request_error", "thinking_required")
 			return
 		}
 	}
@@ -340,8 +352,9 @@ func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
 	} else {
 		model := a.models[modelID]
 		attempt := copyPayload(payload)
+		configureThinking(attempt, a.thinking)
 		adjustments := clampMaxTokens(attempt, model.maxTokens)
-		log.Printf("completion: trying model=%s stream=%t max_tokens=%d adjustments=%q", modelID, streamToClient, model.maxTokens, strings.Join(adjustments, ","))
+		log.Printf("completion: trying model=%s stream=%t thinking=%t max_tokens=%d adjustments=%q", modelID, streamToClient, a.thinking, model.maxTokens, strings.Join(adjustments, ","))
 		response, err = model.source.Complete(r.Context(), provider.Request{Model: model.id, Payload: attempt, Stream: streamToClient})
 	}
 	if err != nil {
@@ -381,8 +394,9 @@ func (a *app) completeDefault(ctx context.Context, payload map[string]json.RawMe
 	for _, id := range a.defaultCandidateIDs() {
 		model := a.models[id]
 		attempt := copyPayload(payload)
+		configureThinking(attempt, a.thinking)
 		adjustments := clampMaxTokens(attempt, model.maxTokens)
-		log.Printf("completion: trying model=%s stream=%t max_tokens=%d adjustments=%q", id, stream, model.maxTokens, strings.Join(adjustments, ","))
+		log.Printf("completion: trying model=%s stream=%t thinking=%t max_tokens=%d adjustments=%q", id, stream, a.thinking, model.maxTokens, strings.Join(adjustments, ","))
 		response, err := model.source.Complete(ctx, provider.Request{Model: model.id, Payload: attempt, Stream: stream})
 		if err != nil {
 			log.Printf("completion: model=%s failed: %v", id, err)
@@ -430,6 +444,15 @@ func copyPayload(payload map[string]json.RawMessage) map[string]json.RawMessage 
 		copy[key] = value
 	}
 	return copy
+}
+
+func configureThinking(payload map[string]json.RawMessage, enabled bool) {
+	if enabled {
+		return
+	}
+	delete(payload, "include_reasoning")
+	delete(payload, "reasoning_effort")
+	payload["reasoning"] = json.RawMessage(`{"enabled":false}`)
 }
 
 func clampMaxTokens(payload map[string]json.RawMessage, maximum int) []string {
@@ -607,8 +630,18 @@ func (a *app) applySavedMaxTokens(limits map[string]int) {
 
 func (a *app) defaultCandidateIDs() []string {
 	a.rankingMu.RLock()
-	defer a.rankingMu.RUnlock()
-	return append([]string(nil), a.defaultCandidates...)
+	candidates := append([]string(nil), a.defaultCandidates...)
+	a.rankingMu.RUnlock()
+	if a.thinking {
+		return candidates
+	}
+	available := candidates[:0]
+	for _, id := range candidates {
+		if !a.models[id].thinkingRequired {
+			available = append(available, id)
+		}
+	}
+	return available
 }
 
 func (a *app) setDefaultCandidates(ranked []string) {
