@@ -20,7 +20,7 @@ func TestProvidersShareFreeModelListAndRouteRequests(t *testing.T) {
 		switch r.URL.Path {
 		case "/catalog":
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"opencode":{"models":{"big-pickle":{"cost":{"input":0,"output":0}},"paid-model":{"cost":{"input":1,"output":1}}}}}`)
+			fmt.Fprint(w, `{"opencode":{"models":{"big-pickle":{"cost":{"input":0,"output":0},"limit":{"output":128}},"paid-model":{"cost":{"input":1,"output":1}}}}}`)
 		case "/zen/v1/chat/completions":
 			openCodeCalls++
 			if got := r.Header.Get("Authorization"); got != "Bearer public" {
@@ -58,7 +58,7 @@ func TestProvidersShareFreeModelListAndRouteRequests(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, `{"data":[
-				{"id":"free/model:free","pricing":{"prompt":"0","completion":"0"}},
+				{"id":"free/model:free","pricing":{"prompt":"0","completion":"0"},"top_provider":{"max_completion_tokens":256}},
 				{"id":"request-fee","pricing":{"prompt":"0","completion":"0","request":"0.01"}},
 				{"id":"paid/model","pricing":{"prompt":"0.1","completion":"0.2"}}
 			]}`)
@@ -118,14 +118,15 @@ func TestProvidersShareFreeModelListAndRouteRequests(t *testing.T) {
 		}
 		var response struct {
 			Data []struct {
-				ID      string `json:"id"`
-				OwnedBy string `json:"owned_by"`
+				ID        string `json:"id"`
+				OwnedBy   string `json:"owned_by"`
+				MaxTokens int    `json:"max_tokens"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 			t.Fatal(err)
 		}
-		if len(response.Data) != 3 || response.Data[0].ID != defaultModelID || response.Data[0].OwnedBy != "free-proxy" || response.Data[1].ID != "opencode/big-pickle" || response.Data[2].ID != "openrouter/free/model:free" || response.Data[2].OwnedBy != "openrouter" {
+		if len(response.Data) != 3 || response.Data[0].ID != defaultModelID || response.Data[0].OwnedBy != "free-proxy" || response.Data[1].ID != "opencode/big-pickle" || response.Data[1].MaxTokens != 128 || response.Data[2].ID != "openrouter/free/model:free" || response.Data[2].OwnedBy != "openrouter" || response.Data[2].MaxTokens != 256 {
 			t.Fatalf("unexpected models: %s", rec.Body.String())
 		}
 	})
@@ -240,7 +241,7 @@ func TestRerankSavesAndUsesRanking(t *testing.T) {
 	calls := 0
 	ranker := testProvider{
 		id:     "ranker",
-		models: []provider.Model{{ID: "best"}, {ID: "fallback"}},
+		models: []provider.Model{{ID: "best", MaxTokens: 256}, {ID: "fallback", MaxTokens: 128}},
 		complete: func(request provider.Request) (provider.Response, error) {
 			calls++
 			var messages []struct {
@@ -268,8 +269,15 @@ func TestRerankSavesAndUsesRanking(t *testing.T) {
 	uiRequest := httptest.NewRequest(http.MethodGet, "/", nil)
 	uiRequest.RemoteAddr = "172.30.32.2:1234"
 	app.ServeHTTP(ui, uiRequest)
-	if ui.Code != http.StatusOK || !strings.Contains(ui.Body.String(), "Rerank free models") {
+	if ui.Code != http.StatusOK || !strings.Contains(ui.Body.String(), "Rerank free models") || !strings.Contains(ui.Body.String(), "/v1/models") || !strings.Contains(ui.Body.String(), "@tailwindcss/browser@4") {
 		t.Fatalf("unexpected ingress UI: %d %s", ui.Code, ui.Body.String())
+	}
+	models := httptest.NewRecorder()
+	modelsRequest := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	modelsRequest.RemoteAddr = "172.30.32.2:1234"
+	app.ServeHTTP(models, modelsRequest)
+	if models.Code != http.StatusOK {
+		t.Fatalf("unexpected ingress models response: %d %s", models.Code, models.Body.String())
 	}
 
 	rec := httptest.NewRecorder()
@@ -280,14 +288,15 @@ func TestRerankSavesAndUsesRanking(t *testing.T) {
 		t.Fatalf("unexpected rerank response: %d %s", rec.Code, rec.Body.String())
 	}
 	var ranking savedRanking
-	if err := json.Unmarshal(rec.Body.Bytes(), &ranking); err != nil || ranking.RankedBy != "ranker/fallback" {
+	if err := json.Unmarshal(rec.Body.Bytes(), &ranking); err != nil || ranking.RankedBy != "ranker/fallback" || ranking.MaxTokens["ranker/fallback"] != 128 || ranking.MaxTokens["ranker/best"] != 256 {
 		t.Fatalf("unexpected rerank result: %s", rec.Body.String())
 	}
 	if calls != 2 || app.defaultCandidateIDs()[0] != "ranker/fallback" {
 		t.Fatalf("calls=%d ranking=%v", calls, app.defaultCandidateIDs())
 	}
 
-	reloaded, err := newApp([]provider.Provider{ranker}, defaultModelID, "key")
+	reloadedSource := testProvider{id: "ranker", models: []provider.Model{{ID: "best"}, {ID: "fallback"}}}
+	reloaded, err := newApp([]provider.Provider{reloadedSource}, defaultModelID, "key")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +304,32 @@ func TestRerankSavesAndUsesRanking(t *testing.T) {
 	if err := reloaded.loadRanking(); err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.defaultCandidateIDs()[0] != "ranker/fallback" {
-		t.Fatalf("reloaded ranking=%v", reloaded.defaultCandidateIDs())
+	if reloaded.defaultCandidateIDs()[0] != "ranker/fallback" || reloaded.models["ranker/fallback"].maxTokens != 128 || reloaded.models["ranker/best"].maxTokens != 256 {
+		t.Fatalf("reloaded ranking=%v limits=%v", reloaded.defaultCandidateIDs(), reloaded.rankingMaxTokens(reloaded.concreteModelIDs()))
+	}
+}
+
+func TestDefaultModelClampsMaxTokens(t *testing.T) {
+	limited := testProvider{
+		id:     "limited",
+		models: []provider.Model{{ID: "small", MaxTokens: 128}},
+		complete: func(request provider.Request) (provider.Response, error) {
+			for field, want := range map[string]int{"max_tokens": 128, "max_completion_tokens": 128} {
+				var got int
+				if err := json.Unmarshal(request.Payload[field], &got); err != nil || got != want {
+					t.Errorf("%s = %s, want %d", field, request.Payload[field], want)
+				}
+			}
+			return testResponse(http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`), nil
+		},
+	}
+	app, err := newApp([]provider.Provider{limited}, defaultModelID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"default","max_tokens":150,"max_completion_tokens":160,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
