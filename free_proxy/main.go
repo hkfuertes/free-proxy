@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -367,6 +368,9 @@ func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadGateway, "could not reach "+sourceID, "api_error", "upstream_unavailable")
 		return
 	}
+	if modelID != defaultModelID {
+		normalizeEmbeddedUpstreamError(response)
+	}
 	defer response.HTTP.Body.Close()
 	log.Printf("completion: model=%s status=%d upstream_stream=%t", sourceID, response.HTTP.StatusCode, response.Stream)
 	if response.HTTP.StatusCode < http.StatusOK || response.HTTP.StatusCode >= http.StatusMultipleChoices {
@@ -409,7 +413,7 @@ func (a *app) completeDefault(ctx context.Context, payload map[string]json.RawMe
 			lastModel = id
 			continue
 		}
-		if retryableStatus(response.HTTP.StatusCode) {
+		if normalizeEmbeddedUpstreamError(response) || retryableStatus(response.HTTP.StatusCode) {
 			log.Printf("completion: model=%s status=%d; trying fallback", id, response.HTTP.StatusCode)
 			closeResponse(lastResponse)
 			lastResponse = response
@@ -430,6 +434,32 @@ func (a *app) completeDefault(ctx context.Context, payload map[string]json.RawMe
 
 func retryableStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func normalizeEmbeddedUpstreamError(response provider.Response) bool {
+	if response.Stream || response.HTTP == nil || response.HTTP.Body == nil || response.HTTP.StatusCode < http.StatusOK || response.HTTP.StatusCode >= http.StatusMultipleChoices {
+		return false
+	}
+	body := response.HTTP.Body
+	probe, err := io.ReadAll(io.LimitReader(body, 4<<10))
+	response.HTTP.Body = &replayReadCloser{Reader: io.MultiReader(bytes.NewReader(probe), body), Closer: body}
+	if err != nil {
+		return false
+	}
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(probe, &envelope) != nil || len(envelope.Error) == 0 {
+		return false
+	}
+	response.HTTP.StatusCode = http.StatusBadGateway
+	response.HTTP.Status = http.StatusText(http.StatusBadGateway)
+	return true
+}
+
+type replayReadCloser struct {
+	io.Reader
+	io.Closer
 }
 
 func closeResponse(response provider.Response) {
