@@ -1,5 +1,6 @@
 .env
 .env.*
+data/
 *.test
 coverage.out
 free_proxy/free-proxy

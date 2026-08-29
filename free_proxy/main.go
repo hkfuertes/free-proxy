@@ -2,28 +2,55 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"free-proxy/provider"
 )
 
-const maxRequestBytes = 10 << 20
+const (
+	maxRequestBytes = 10 << 20
+	defaultModelID  = "default"
+)
+
+var defaultModelRanking = []string{
+	"openrouter/z-ai/glm-5.2:free",
+	"openrouter/minimax/minimax-m3:free",
+	"openrouter/thinkingmachines/inkling:free",
+	"openrouter/thinkingmachines/inkling-small:free",
+	"openrouter/minimax/minimax-m2.7:free",
+	"openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+	"opencode/nemotron-3-ultra-free",
+	"opencode/muse-spark-1.2-contributor-free",
+	"opencode/hy3-free",
+	"opencode/big-pickle",
+	"openrouter/google/gemma-4-31b-it:free",
+	"openrouter/google/gemma-4-26b-a4b-it:free",
+	"openrouter/openrouter/free",
+}
 
 type app struct {
-	models       map[string]resolvedModel
-	modelIDs     []string
-	defaultModel string
-	clientKey    string
+	models            map[string]resolvedModel
+	modelIDs          []string
+	defaultModel      string
+	defaultCandidates []string
+	rankingPath       string
+	clientKey         string
+	rankingMu         sync.RWMutex
+	rerankMu          sync.Mutex
 }
 
 type resolvedModel struct {
@@ -76,10 +103,20 @@ func appFromEnv() (*app, string, error) {
 		sources = append(sources, openRouter)
 	}
 
-	defaultOpenCodeModel := envOr("OPENCODE_DEFAULT_MODEL", provider.DefaultOpenCodeModel)
-	defaultModel := envOrOption("DEFAULT_MODEL", options.DefaultModel, "opencode/"+defaultOpenCodeModel)
+	fallbackModel := defaultModelID
+	if model := strings.TrimSpace(os.Getenv("OPENCODE_DEFAULT_MODEL")); model != "" {
+		fallbackModel = "opencode/" + model
+	}
+	defaultModel := envOrOption("DEFAULT_MODEL", options.DefaultModel, fallbackModel)
 	server, err := newApp(sources, defaultModel, envOrOption("PROXY_API_KEY", options.ProxyAPIKey, ""))
-	return server, envOrOption("LISTEN_ADDR", options.ListenAddr, "127.0.0.1:8080"), err
+	if err != nil {
+		return nil, "", err
+	}
+	server.rankingPath = envOr("RANKING_PATH", "/data/free-proxy-ranking.json")
+	if err := server.loadOrCreateRanking(context.Background()); err != nil {
+		log.Printf("prepare ranking: %v", err)
+	}
+	return server, envOrOption("LISTEN_ADDR", options.ListenAddr, "127.0.0.1:8080"), nil
 }
 
 func newApp(sources []provider.Provider, defaultModel, clientKey string) (*app, error) {
@@ -102,15 +139,23 @@ func newApp(sources []provider.Provider, defaultModel, clientKey string) (*app, 
 	if len(models) == 0 {
 		return nil, errors.New("no models configured")
 	}
-	if _, ok := models[defaultModel]; !ok {
-		return nil, fmt.Errorf("default model %q is not configured", defaultModel)
+	if defaultModel != defaultModelID {
+		if _, ok := models[defaultModel]; !ok {
+			return nil, fmt.Errorf("default model %q is not configured", defaultModel)
+		}
 	}
-	modelIDs := make([]string, 0, len(models))
+	modelIDs := make([]string, 0, len(models)+1)
 	for id := range models {
 		modelIDs = append(modelIDs, id)
 	}
 	sort.Strings(modelIDs)
-	return &app{models: models, modelIDs: modelIDs, defaultModel: defaultModel, clientKey: clientKey}, nil
+	candidates := rankedDefaultCandidates(models, modelIDs)
+	modelIDs = append([]string{defaultModelID}, modelIDs...)
+	return &app{models: models, modelIDs: modelIDs, defaultModel: defaultModel, defaultCandidates: candidates, clientKey: clientKey}, nil
+}
+
+func rankedDefaultCandidates(models map[string]resolvedModel, modelIDs []string) []string {
+	return mergeRanking(defaultModelRanking, modelIDs, models)
 }
 
 func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -122,12 +167,24 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	if !a.authorized(r) {
+	if !a.authorized(r) && !isIngressUIRequest(r) {
 		writeAPIError(w, http.StatusUnauthorized, "invalid proxy API key", "authentication_error", "invalid_api_key")
 		return
 	}
 
 	switch {
+	case r.URL.Path == "/":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		a.handleUI(w, r)
+	case r.URL.Path == "/rerank":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		a.handleRerank(w, r)
 	case r.URL.Path == "/v1/models":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -159,6 +216,32 @@ func (a *app) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(value), []byte(a.clientKey)) == 1
 }
 
+func isIngressUIRequest(r *http.Request) bool {
+	if r.URL.Path != "/" && r.URL.Path != "/rerank" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	return err == nil && host == "172.30.32.2"
+}
+
+func (a *app) handleUI(w http.ResponseWriter, r *http.Request) {
+	base, _ := json.Marshal(strings.TrimRight(r.Header.Get("X-Ingress-Path"), "/"))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>Free Proxy</title><button id="rerank">Rerank free models</button><pre id="status"></pre><script>
+const base=%s, button=document.querySelector("#rerank"), status=document.querySelector("#status");
+button.onclick=async()=>{button.disabled=true;status.textContent="Ranking...";try{const response=await fetch(base+"/rerank",{method:"POST"}),result=await response.json();if(!response.ok)throw new Error(result.error?.message||response.status);status.textContent="Saved "+result.models.length+" models, ranked by "+result.ranked_by+"."}catch(error){status.textContent="Error: "+error.message}finally{button.disabled=false}};
+</script>`, base)
+}
+
+func (a *app) handleRerank(w http.ResponseWriter, r *http.Request) {
+	ranking, err := a.rerank(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusBadGateway, "could not rerank free models: "+err.Error(), "api_error", "rerank_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, ranking)
+}
+
 type modelInfo struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
@@ -169,12 +252,20 @@ type modelInfo struct {
 func (a *app) handleModels(w http.ResponseWriter) {
 	data := make([]modelInfo, 0, len(a.modelIDs))
 	for _, id := range a.modelIDs {
+		if id == defaultModelID {
+			data = append(data, modelInfo{ID: id, Object: "model", Created: 0, OwnedBy: "free-proxy"})
+			continue
+		}
 		data = append(data, modelInfo{ID: id, Object: "model", Created: 0, OwnedBy: a.models[id].source.ID()})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
 func (a *app) handleModel(w http.ResponseWriter, id string) {
+	if id == defaultModelID {
+		writeJSON(w, http.StatusOK, modelInfo{ID: id, Object: "model", Created: 0, OwnedBy: "free-proxy"})
+		return
+	}
 	model, ok := a.models[id]
 	if !ok {
 		writeAPIError(w, http.StatusNotFound, "model not found", "invalid_request_error", "model_not_found")
@@ -210,10 +301,11 @@ func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	model, ok := a.models[modelID]
-	if !ok {
-		writeAPIError(w, http.StatusBadRequest, "model is not configured", "invalid_request_error", "model_not_found")
-		return
+	if modelID != defaultModelID {
+		if _, ok := a.models[modelID]; !ok {
+			writeAPIError(w, http.StatusBadRequest, "model is not configured", "invalid_request_error", "model_not_found")
+			return
+		}
 	}
 
 	streamToClient := false
@@ -223,18 +315,23 @@ func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	response, err := model.source.Complete(r.Context(), provider.Request{
-		Model:   model.id,
-		Payload: payload,
-		Stream:  streamToClient,
-	})
+
+	var response provider.Response
+	sourceID := modelID
+	if modelID == defaultModelID {
+		response, sourceID, err = a.completeDefault(r.Context(), payload, streamToClient)
+	} else {
+		model := a.models[modelID]
+		sourceID = model.source.ID()
+		response, err = model.source.Complete(r.Context(), provider.Request{Model: model.id, Payload: payload, Stream: streamToClient})
+	}
 	if err != nil {
 		var requestErr *provider.RequestError
 		if errors.As(err, &requestErr) {
 			writeAPIError(w, http.StatusBadRequest, requestErr.Message, "invalid_request_error", "invalid_request")
 			return
 		}
-		writeAPIError(w, http.StatusBadGateway, "could not reach "+model.source.ID(), "api_error", "upstream_unavailable")
+		writeAPIError(w, http.StatusBadGateway, "could not reach "+sourceID, "api_error", "upstream_unavailable")
 		return
 	}
 	defer response.HTTP.Body.Close()
@@ -249,10 +346,240 @@ func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
 
 	completion, err := aggregateStream(response.HTTP.Body, modelID)
 	if err != nil {
-		writeAPIError(w, http.StatusBadGateway, "invalid streaming response from "+model.source.ID()+": "+err.Error(), "api_error", "invalid_upstream_response")
+		writeAPIError(w, http.StatusBadGateway, "invalid streaming response from "+sourceID+": "+err.Error(), "api_error", "invalid_upstream_response")
 		return
 	}
 	writeJSON(w, http.StatusOK, completion)
+}
+
+func (a *app) completeDefault(ctx context.Context, payload map[string]json.RawMessage, stream bool) (provider.Response, string, error) {
+	var lastResponse provider.Response
+	var lastModel string
+	var lastErr error
+	for _, id := range a.defaultCandidateIDs() {
+		model := a.models[id]
+		response, err := model.source.Complete(ctx, provider.Request{Model: model.id, Payload: copyPayload(payload), Stream: stream})
+		if err != nil {
+			var requestErr *provider.RequestError
+			if errors.As(err, &requestErr) && !requestErr.ModelUnavailable {
+				closeResponse(lastResponse)
+				return provider.Response{}, id, err
+			}
+			lastErr = err
+			lastModel = id
+			continue
+		}
+		if retryableStatus(response.HTTP.StatusCode) {
+			closeResponse(lastResponse)
+			lastResponse = response
+			lastModel = id
+			continue
+		}
+		closeResponse(lastResponse)
+		return response, id, nil
+	}
+	if lastResponse.HTTP != nil {
+		return lastResponse, lastModel, nil
+	}
+	if lastErr != nil {
+		return provider.Response{}, lastModel, lastErr
+	}
+	return provider.Response{}, defaultModelID, errors.New("no default model available")
+}
+
+func retryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func closeResponse(response provider.Response) {
+	if response.HTTP != nil && response.HTTP.Body != nil {
+		response.HTTP.Body.Close()
+	}
+}
+
+func copyPayload(payload map[string]json.RawMessage) map[string]json.RawMessage {
+	copy := make(map[string]json.RawMessage, len(payload))
+	for key, value := range payload {
+		copy[key] = value
+	}
+	return copy
+}
+
+type savedRanking struct {
+	Models    []string  `json:"models"`
+	RankedBy  string    `json:"ranked_by"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (a *app) rerank(ctx context.Context) (savedRanking, error) {
+	a.rerankMu.Lock()
+	defer a.rerankMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	ids := a.concreteModelIDs()
+	messages, err := json.Marshal([]map[string]string{{"role": "user", "content": rankingPrompt(ids)}})
+	if err != nil {
+		return savedRanking{}, err
+	}
+	response, sourceID, err := a.completeDefault(ctx, map[string]json.RawMessage{
+		"messages":    messages,
+		"max_tokens":  json.RawMessage("2048"),
+		"temperature": json.RawMessage("0"),
+	}, false)
+	if err != nil {
+		return savedRanking{}, err
+	}
+	defer response.HTTP.Body.Close()
+	if response.HTTP.StatusCode < http.StatusOK || response.HTTP.StatusCode >= http.StatusMultipleChoices {
+		return savedRanking{}, fmt.Errorf("ranking model returned HTTP %d", response.HTTP.StatusCode)
+	}
+	content, err := rankingContent(response)
+	if err != nil {
+		return savedRanking{}, err
+	}
+	models, err := parseRanking(content, a.models, rankedDefaultCandidates(a.models, ids))
+	if err != nil {
+		return savedRanking{}, err
+	}
+	ranking := savedRanking{Models: models, RankedBy: sourceID, UpdatedAt: time.Now().UTC()}
+	if err := saveRanking(a.rankingPath, ranking); err != nil {
+		return savedRanking{}, err
+	}
+	a.setDefaultCandidates(models)
+	return ranking, nil
+}
+
+func rankingPrompt(ids []string) string {
+	encoded, _ := json.Marshal(ids)
+	return "Rank these currently free chat models for general reasoning and coding. Return only one JSON array containing every exact ID once, best first: " + string(encoded)
+}
+
+func rankingContent(response provider.Response) (string, error) {
+	if response.Stream {
+		completion, err := aggregateStream(response.HTTP.Body, defaultModelID)
+		if err != nil {
+			return "", err
+		}
+		if len(completion.Choices) == 0 {
+			return "", errors.New("ranking model returned no choices")
+		}
+		content, ok := completion.Choices[0].Message.Content.(string)
+		if !ok || content == "" {
+			return "", errors.New("ranking model returned no text")
+		}
+		return content, nil
+	}
+	var completion struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(response.HTTP.Body).Decode(&completion); err != nil {
+		return "", err
+	}
+	if len(completion.Choices) == 0 || completion.Choices[0].Message.Content == "" {
+		return "", errors.New("ranking model returned no text")
+	}
+	return completion.Choices[0].Message.Content, nil
+}
+
+func parseRanking(content string, models map[string]resolvedModel, fallback []string) ([]string, error) {
+	var ranked []string
+	content = strings.TrimSpace(content)
+	if err := json.Unmarshal([]byte(content), &ranked); err != nil {
+		start, end := strings.Index(content, "["), strings.LastIndex(content, "]")
+		if start < 0 || end <= start || json.Unmarshal([]byte(content[start:end+1]), &ranked) != nil {
+			return nil, errors.New("ranking model did not return a JSON array")
+		}
+	}
+	known := 0
+	for _, id := range ranked {
+		if _, ok := models[id]; ok {
+			known++
+		}
+	}
+	if known == 0 {
+		return nil, errors.New("ranking model returned no known models")
+	}
+	return mergeRanking(ranked, fallback, models), nil
+}
+
+func mergeRanking(ranked, fallback []string, models map[string]resolvedModel) []string {
+	result := make([]string, 0, len(models))
+	seen := map[string]bool{}
+	add := func(id string) {
+		if _, ok := models[id]; ok && !seen[id] {
+			seen[id] = true
+			result = append(result, id)
+		}
+	}
+	for _, id := range ranked {
+		add(id)
+	}
+	for _, id := range fallback {
+		add(id)
+	}
+	return result
+}
+
+func (a *app) concreteModelIDs() []string {
+	ids := make([]string, 0, len(a.models))
+	for id := range a.models {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (a *app) defaultCandidateIDs() []string {
+	a.rankingMu.RLock()
+	defer a.rankingMu.RUnlock()
+	return append([]string(nil), a.defaultCandidates...)
+}
+
+func (a *app) setDefaultCandidates(ranked []string) {
+	candidates := mergeRanking(ranked, rankedDefaultCandidates(a.models, a.concreteModelIDs()), a.models)
+	a.rankingMu.Lock()
+	a.defaultCandidates = candidates
+	a.rankingMu.Unlock()
+}
+
+func (a *app) loadRanking() error {
+	data, err := os.ReadFile(a.rankingPath)
+	if err != nil {
+		return err
+	}
+	var ranking savedRanking
+	if err := json.Unmarshal(data, &ranking); err != nil {
+		return err
+	}
+	if len(ranking.Models) == 0 {
+		return errors.New("saved ranking has no models")
+	}
+	a.setDefaultCandidates(ranking.Models)
+	return nil
+}
+
+func (a *app) loadOrCreateRanking(ctx context.Context) error {
+	if err := a.loadRanking(); !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err := a.rerank(ctx)
+	return err
+}
+
+func saveRanking(path string, ranking savedRanking) error {
+	data, err := json.MarshalIndent(ranking, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 type streamChunk struct {

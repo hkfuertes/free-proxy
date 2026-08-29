@@ -45,3 +45,21 @@ func TestOpenRouterRejectsModelWhenItsPriceChanges(t *testing.T) {
 		t.Fatalf("catalog calls=%d completion calls=%d", catalogCalls, completionCalls)
 	}
 }
+
+func TestDiscoverFreeModelsHandlesPricingOverrides(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":[
+			{"id":"free/with-overrides","pricing":{"prompt":"0","completion":"0","overrides":[{"min_prompt_tokens":42,"prompt":"0","completion":"0"}]}},
+			{"id":"paid/with-overrides","pricing":{"prompt":"0","completion":"0","overrides":[{"utc_days":["saturday"],"prompt":"0.01","completion":"0"}]}}
+		]}`)
+	}))
+	defer upstream.Close()
+
+	models, err := discoverFreeModels(context.Background(), upstream.Client(), upstream.URL, "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != "free/with-overrides" {
+		t.Fatalf("models = %#v", models)
+	}
+}
