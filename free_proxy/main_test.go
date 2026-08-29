@@ -201,6 +201,12 @@ func TestDefaultModelFallsBack(t *testing.T) {
 				return provider.Response{}, &provider.RequestError{Message: "model is no longer free", ModelUnavailable: true}
 			},
 		},
+		{
+			name: "embedded upstream error",
+			first: func() (provider.Response, error) {
+				return testResponse(http.StatusOK, `{"error":{"message":"Upstream error from Nvidia: Service temporarily overloaded"}}`), nil
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var calls []string
