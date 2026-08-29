@@ -17,6 +17,7 @@ openrouter/nvidia/nemotron-3.5-lightning:free
 - An unknown, paid, or no-longer-free model returns `400` **without sending a completion request upstream**.
 - `/v1/models` is the startup snapshot. Restart the add-on or container to refresh the displayed list.
 - `default` is a virtual model: it tries the saved ranking, then the remaining free models, retrying only `429` and `5xx` responses.
+- Concrete model entries include their advertised `max_tokens`; explicit `max_tokens` and `max_completion_tokens` values are capped before the request is sent upstream.
 
 OpenRouter is enabled only when an API key is configured. Its catalog is filtered so every published price must be zero.
 
@@ -102,7 +103,7 @@ The add-on reads these options from `/data/options.json`. Equivalent environment
 | `OPTIONS_PATH` | Add-on options path; defaults to `/data/options.json`. |
 | `RANKING_PATH` | Saved `default` ranking; defaults to `/data/free-proxy-ranking.json`. |
 
-Open the add-on's Web UI and click **Rerank free models** to refresh `default`; Home Assistant ingress authenticates that button. The native add-on settings schema cannot provide a custom action button.
+Open the add-on's Web UI to browse and copy available model IDs, then paste an exact ID into `default_model` if you want to pin one. Click **Rerank free models** there to refresh `default`; Home Assistant ingress authenticates the UI. The native add-on settings schema cannot provide a custom action button.
 
 Configure an OpenAI-compatible Home Assistant client with:
 

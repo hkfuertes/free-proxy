@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -54,8 +55,9 @@ type app struct {
 }
 
 type resolvedModel struct {
-	source provider.Provider
-	id     string
+	source    provider.Provider
+	id        string
+	maxTokens int
 }
 
 func main() {
@@ -112,6 +114,10 @@ func appFromEnv() (*app, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	for _, source := range sources {
+		log.Printf("provider %s: %d free models", source.ID(), len(source.Models()))
+	}
+	log.Printf("configured %d free models", len(server.models))
 	server.rankingPath = envOr("RANKING_PATH", "/data/free-proxy-ranking.json")
 	if err := server.loadOrCreateRanking(context.Background()); err != nil {
 		log.Printf("prepare ranking: %v", err)
@@ -133,7 +139,7 @@ func newApp(sources []provider.Provider, defaultModel, clientKey string) (*app, 
 			if existing, exists := models[publicID]; exists {
 				return nil, fmt.Errorf("model %q belongs to both %s and %s", publicID, existing.source.ID(), source.ID())
 			}
-			models[publicID] = resolvedModel{source: source, id: model.ID}
+			models[publicID] = resolvedModel{source: source, id: model.ID, maxTokens: model.MaxTokens}
 		}
 	}
 	if len(models) == 0 {
@@ -167,7 +173,7 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	if !a.authorized(r) && !isIngressUIRequest(r) {
+	if !a.authorized(r) && !isIngressRequest(r) {
 		writeAPIError(w, http.StatusUnauthorized, "invalid proxy API key", "authentication_error", "invalid_api_key")
 		return
 	}
@@ -216,8 +222,10 @@ func (a *app) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(value), []byte(a.clientKey)) == 1
 }
 
-func isIngressUIRequest(r *http.Request) bool {
-	if r.URL.Path != "/" && r.URL.Path != "/rerank" {
+func isIngressRequest(r *http.Request) bool {
+	switch r.URL.Path {
+	case "/", "/rerank", "/v1/models":
+	default:
 		return false
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -227,15 +235,22 @@ func isIngressUIRequest(r *http.Request) bool {
 func (a *app) handleUI(w http.ResponseWriter, r *http.Request) {
 	base, _ := json.Marshal(strings.TrimRight(r.Header.Get("X-Ingress-Path"), "/"))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>Free Proxy</title><button id="rerank">Rerank free models</button><pre id="status"></pre><script>
-const base=%s, button=document.querySelector("#rerank"), status=document.querySelector("#status");
-button.onclick=async()=>{button.disabled=true;status.textContent="Ranking...";try{const response=await fetch(base+"/rerank",{method:"POST"}),result=await response.json();if(!response.ok)throw new Error(result.error?.message||response.status);status.textContent="Saved "+result.models.length+" models, ranked by "+result.ranked_by+"."}catch(error){status.textContent="Error: "+error.message}finally{button.disabled=false}};
-</script>`, base)
+	// ponytail: Tailwind's browser CDN avoids a frontend build; bundle generated CSS if ingress blocks the CDN.
+	fmt.Fprintf(w, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Free Proxy</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head><body class="min-h-screen bg-slate-950 text-slate-100"><main class="mx-auto max-w-5xl p-6 sm:p-10"><header class="flex flex-col gap-5 border-b border-slate-800 pb-8 sm:flex-row sm:items-center sm:justify-between"><div><p class="text-sm font-medium text-cyan-300">Home Assistant add-on</p><h1 class="mt-1 text-3xl font-bold tracking-tight">Free Proxy</h1><p class="mt-2 text-slate-400">Free OpenCode and OpenRouter models, routed through one OpenAI-compatible API.</p></div><button id="rerank" class="rounded-lg bg-cyan-400 px-4 py-2.5 font-semibold text-slate-950 shadow-sm transition hover:bg-cyan-300 disabled:cursor-wait disabled:opacity-60">Rerank free models</button></header><p id="status" class="mt-4 min-h-5 text-sm" aria-live="polite"></p><section class="mt-8 rounded-xl border border-slate-800 bg-slate-900/60 p-5 shadow-2xl shadow-slate-950/30"><div class="flex flex-col gap-1 sm:flex-row sm:items-baseline sm:justify-between"><h2 class="text-xl font-semibold">Available models</h2><p class="text-sm text-slate-400">Copy an ID, then paste it into <code class="rounded bg-slate-800 px-1 py-0.5 text-slate-200">default_model</code> in add-on configuration.</p></div><div id="models" class="mt-5 grid gap-3 sm:grid-cols-2"><p class="text-slate-400">Loading models...</p></div></section></main><script>
+const base=%s, button=document.querySelector("#rerank"), status=document.querySelector("#status"), models=document.querySelector("#models");
+function setStatus(message,error){status.textContent=message;status.className="mt-4 min-h-5 text-sm "+(error?"text-rose-300":"text-emerald-300")}
+async function copyModel(id){try{await navigator.clipboard.writeText(id);setStatus("Copied "+id+". Set it as default_model in add-on configuration.")}catch(error){window.prompt("Copy model ID",id)}}
+function renderModels(data){models.replaceChildren();for(const model of data){const card=document.createElement("article"),details=document.createElement("div"),id=document.createElement("p"),meta=document.createElement("p"),copy=document.createElement("button");card.className="flex items-center justify-between gap-4 rounded-lg border border-slate-800 bg-slate-950/60 p-4";details.className="min-w-0";id.className="truncate font-mono text-sm text-slate-100";id.textContent=model.id;meta.className="mt-1 text-xs text-slate-400";meta.textContent=model.id==="default"?"Ranked free-model route":model.owned_by+(model.max_tokens?" / max "+model.max_tokens+" tokens":"");copy.className="shrink-0 rounded-md border border-slate-700 px-3 py-1.5 text-sm font-medium text-cyan-300 transition hover:border-cyan-400 hover:text-cyan-200";copy.textContent="Copy";copy.addEventListener("click",()=>copyModel(model.id));details.append(id,meta);card.append(details,copy);models.append(card)}}
+async function loadModels(){const response=await fetch(base+"/v1/models"),result=await response.json();if(!response.ok)throw new Error(result.error?.message||response.status);renderModels(result.data)}
+button.addEventListener("click",async()=>{button.disabled=true;setStatus("Ranking...");try{const response=await fetch(base+"/rerank",{method:"POST"}),result=await response.json();if(!response.ok)throw new Error(result.error?.message||response.status);setStatus("Saved "+result.models.length+" models, ranked by "+result.ranked_by+".");await loadModels()}catch(error){setStatus("Error: "+error.message,true)}finally{button.disabled=false}});
+loadModels().catch(error=>setStatus("Error loading models: "+error.message,true));
+</script></body></html>`, base)
 }
 
 func (a *app) handleRerank(w http.ResponseWriter, r *http.Request) {
 	ranking, err := a.rerank(r.Context())
 	if err != nil {
+		log.Printf("rerank: failed: %v", err)
 		writeAPIError(w, http.StatusBadGateway, "could not rerank free models: "+err.Error(), "api_error", "rerank_failed")
 		return
 	}
@@ -243,10 +258,11 @@ func (a *app) handleRerank(w http.ResponseWriter, r *http.Request) {
 }
 
 type modelInfo struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID        string `json:"id"`
+	Object    string `json:"object"`
+	Created   int64  `json:"created"`
+	OwnedBy   string `json:"owned_by"`
+	MaxTokens int    `json:"max_tokens,omitempty"`
 }
 
 func (a *app) handleModels(w http.ResponseWriter) {
@@ -256,7 +272,8 @@ func (a *app) handleModels(w http.ResponseWriter) {
 			data = append(data, modelInfo{ID: id, Object: "model", Created: 0, OwnedBy: "free-proxy"})
 			continue
 		}
-		data = append(data, modelInfo{ID: id, Object: "model", Created: 0, OwnedBy: a.models[id].source.ID()})
+		model := a.models[id]
+		data = append(data, modelInfo{ID: id, Object: "model", Created: 0, OwnedBy: model.source.ID(), MaxTokens: model.maxTokens})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
@@ -271,7 +288,7 @@ func (a *app) handleModel(w http.ResponseWriter, id string) {
 		writeAPIError(w, http.StatusNotFound, "model not found", "invalid_request_error", "model_not_found")
 		return
 	}
-	writeJSON(w, http.StatusOK, modelInfo{ID: id, Object: "model", Created: 0, OwnedBy: model.source.ID()})
+	writeJSON(w, http.StatusOK, modelInfo{ID: id, Object: "model", Created: 0, OwnedBy: model.source.ID(), MaxTokens: model.maxTokens})
 }
 
 func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
@@ -322,10 +339,13 @@ func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
 		response, sourceID, err = a.completeDefault(r.Context(), payload, streamToClient)
 	} else {
 		model := a.models[modelID]
-		sourceID = model.source.ID()
-		response, err = model.source.Complete(r.Context(), provider.Request{Model: model.id, Payload: payload, Stream: streamToClient})
+		attempt := copyPayload(payload)
+		adjustments := clampMaxTokens(attempt, model.maxTokens)
+		log.Printf("completion: trying model=%s stream=%t max_tokens=%d adjustments=%q", modelID, streamToClient, model.maxTokens, strings.Join(adjustments, ","))
+		response, err = model.source.Complete(r.Context(), provider.Request{Model: model.id, Payload: attempt, Stream: streamToClient})
 	}
 	if err != nil {
+		log.Printf("completion: model=%s failed: %v", sourceID, err)
 		var requestErr *provider.RequestError
 		if errors.As(err, &requestErr) {
 			writeAPIError(w, http.StatusBadRequest, requestErr.Message, "invalid_request_error", "invalid_request")
@@ -335,6 +355,7 @@ func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer response.HTTP.Body.Close()
+	log.Printf("completion: model=%s status=%d upstream_stream=%t", sourceID, response.HTTP.StatusCode, response.Stream)
 	if response.HTTP.StatusCode < http.StatusOK || response.HTTP.StatusCode >= http.StatusMultipleChoices {
 		forwardResponse(w, response.HTTP)
 		return
@@ -346,6 +367,7 @@ func (a *app) handleCompletion(w http.ResponseWriter, r *http.Request) {
 
 	completion, err := aggregateStream(response.HTTP.Body, modelID)
 	if err != nil {
+		log.Printf("completion: model=%s invalid stream: %v", sourceID, err)
 		writeAPIError(w, http.StatusBadGateway, "invalid streaming response from "+sourceID+": "+err.Error(), "api_error", "invalid_upstream_response")
 		return
 	}
@@ -358,8 +380,12 @@ func (a *app) completeDefault(ctx context.Context, payload map[string]json.RawMe
 	var lastErr error
 	for _, id := range a.defaultCandidateIDs() {
 		model := a.models[id]
-		response, err := model.source.Complete(ctx, provider.Request{Model: model.id, Payload: copyPayload(payload), Stream: stream})
+		attempt := copyPayload(payload)
+		adjustments := clampMaxTokens(attempt, model.maxTokens)
+		log.Printf("completion: trying model=%s stream=%t max_tokens=%d adjustments=%q", id, stream, model.maxTokens, strings.Join(adjustments, ","))
+		response, err := model.source.Complete(ctx, provider.Request{Model: model.id, Payload: attempt, Stream: stream})
 		if err != nil {
+			log.Printf("completion: model=%s failed: %v", id, err)
 			var requestErr *provider.RequestError
 			if errors.As(err, &requestErr) && !requestErr.ModelUnavailable {
 				closeResponse(lastResponse)
@@ -370,6 +396,7 @@ func (a *app) completeDefault(ctx context.Context, payload map[string]json.RawMe
 			continue
 		}
 		if retryableStatus(response.HTTP.StatusCode) {
+			log.Printf("completion: model=%s status=%d; trying fallback", id, response.HTTP.StatusCode)
 			closeResponse(lastResponse)
 			lastResponse = response
 			lastModel = id
@@ -405,10 +432,31 @@ func copyPayload(payload map[string]json.RawMessage) map[string]json.RawMessage 
 	return copy
 }
 
+func clampMaxTokens(payload map[string]json.RawMessage, maximum int) []string {
+	if maximum <= 0 {
+		return nil
+	}
+	var adjustments []string
+	for _, field := range []string{"max_tokens", "max_completion_tokens"} {
+		raw, ok := payload[field]
+		if !ok {
+			continue
+		}
+		var requested int
+		if err := json.Unmarshal(raw, &requested); err != nil || requested <= maximum {
+			continue
+		}
+		payload[field] = json.RawMessage(strconv.Itoa(maximum))
+		adjustments = append(adjustments, fmt.Sprintf("%s=%d->%d", field, requested, maximum))
+	}
+	return adjustments
+}
+
 type savedRanking struct {
-	Models    []string  `json:"models"`
-	RankedBy  string    `json:"ranked_by"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Models    []string       `json:"models"`
+	MaxTokens map[string]int `json:"max_tokens,omitempty"`
+	RankedBy  string         `json:"ranked_by"`
+	UpdatedAt time.Time      `json:"updated_at"`
 }
 
 func (a *app) rerank(ctx context.Context) (savedRanking, error) {
@@ -418,6 +466,7 @@ func (a *app) rerank(ctx context.Context) (savedRanking, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	ids := a.concreteModelIDs()
+	log.Printf("rerank: requesting rank for %d free models", len(ids))
 	messages, err := json.Marshal([]map[string]string{{"role": "user", "content": rankingPrompt(ids)}})
 	if err != nil {
 		return savedRanking{}, err
@@ -442,11 +491,12 @@ func (a *app) rerank(ctx context.Context) (savedRanking, error) {
 	if err != nil {
 		return savedRanking{}, err
 	}
-	ranking := savedRanking{Models: models, RankedBy: sourceID, UpdatedAt: time.Now().UTC()}
+	ranking := savedRanking{Models: models, MaxTokens: a.rankingMaxTokens(models), RankedBy: sourceID, UpdatedAt: time.Now().UTC()}
 	if err := saveRanking(a.rankingPath, ranking); err != nil {
 		return savedRanking{}, err
 	}
 	a.setDefaultCandidates(models)
+	log.Printf("rerank: saved %d models ranked by %s", len(models), sourceID)
 	return ranking, nil
 }
 
@@ -534,6 +584,27 @@ func (a *app) concreteModelIDs() []string {
 	return ids
 }
 
+func (a *app) rankingMaxTokens(ids []string) map[string]int {
+	limits := make(map[string]int, len(ids))
+	for _, id := range ids {
+		if maximum := a.models[id].maxTokens; maximum > 0 {
+			limits[id] = maximum
+		}
+	}
+	return limits
+}
+
+func (a *app) applySavedMaxTokens(limits map[string]int) {
+	for id, maximum := range limits {
+		model, ok := a.models[id]
+		if !ok || maximum <= 0 || model.maxTokens > 0 {
+			continue
+		}
+		model.maxTokens = maximum
+		a.models[id] = model
+	}
+}
+
 func (a *app) defaultCandidateIDs() []string {
 	a.rankingMu.RLock()
 	defer a.rankingMu.RUnlock()
@@ -559,7 +630,9 @@ func (a *app) loadRanking() error {
 	if len(ranking.Models) == 0 {
 		return errors.New("saved ranking has no models")
 	}
+	a.applySavedMaxTokens(ranking.MaxTokens)
 	a.setDefaultCandidates(ranking.Models)
+	log.Printf("ranking: loaded %d models with %d token limits", len(ranking.Models), len(ranking.MaxTokens))
 	return nil
 }
 
@@ -567,6 +640,7 @@ func (a *app) loadOrCreateRanking(ctx context.Context) error {
 	if err := a.loadRanking(); !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	log.Printf("ranking: no saved ranking; generating one")
 	_, err := a.rerank(ctx)
 	return err
 }

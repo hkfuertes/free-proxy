@@ -49,7 +49,7 @@ func TestOpenRouterRejectsModelWhenItsPriceChanges(t *testing.T) {
 func TestDiscoverFreeModelsHandlesPricingOverrides(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data":[
-			{"id":"free/with-overrides","pricing":{"prompt":"0","completion":"0","overrides":[{"min_prompt_tokens":42,"prompt":"0","completion":"0"}]}},
+			{"id":"free/with-overrides","pricing":{"prompt":"0","completion":"0","overrides":[{"min_prompt_tokens":42,"prompt":"0","completion":"0"}]},"top_provider":{"max_completion_tokens":128}},
 			{"id":"paid/with-overrides","pricing":{"prompt":"0","completion":"0","overrides":[{"utc_days":["saturday"],"prompt":"0.01","completion":"0"}]}}
 		]}`)
 	}))
@@ -59,7 +59,22 @@ func TestDiscoverFreeModelsHandlesPricingOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0].ID != "free/with-overrides" {
+	if len(models) != 1 || models[0].ID != "free/with-overrides" || models[0].MaxTokens != 128 {
+		t.Fatalf("models = %#v", models)
+	}
+}
+
+func TestDiscoverFreeOpenCodeModelsCarriesMaxTokens(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"opencode":{"models":{"free":{"cost":{"input":0,"output":0},"limit":{"output":128}}}}}`)
+	}))
+	defer upstream.Close()
+
+	models, err := discoverFreeOpenCodeModels(context.Background(), upstream.Client(), upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != "free" || models[0].MaxTokens != 128 {
 		t.Fatalf("models = %#v", models)
 	}
 }

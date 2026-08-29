@@ -134,6 +134,9 @@ type openCodeCatalog struct {
 type openCodeModel struct {
 	Cost   map[string]json.RawMessage `json:"cost"`
 	Status string                     `json:"status"`
+	Limit  struct {
+		Output int `json:"output"`
+	} `json:"limit"`
 }
 
 func discoverFreeOpenCodeModels(ctx context.Context, client *http.Client, endpoint string) ([]Model, error) {
@@ -159,7 +162,7 @@ func discoverFreeOpenCodeModels(ctx context.Context, client *http.Client, endpoi
 	models := make([]Model, 0, len(catalog.OpenCode.Models))
 	for id, model := range catalog.OpenCode.Models {
 		if model.Status != "deprecated" && freeOpenCodePricing(model.Cost) {
-			models = append(models, Model{ID: id})
+			models = append(models, Model{ID: id, MaxTokens: model.Limit.Output})
 		}
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
